@@ -10,6 +10,7 @@
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "wevtapi.lib")
 
 #define GPU_LOG(msg) \
   fprintf(stderr, "[GPU_RECOVERY] " msg "\n"); fflush(stderr)
@@ -17,6 +18,78 @@
   fprintf(stderr, "[GPU_RECOVERY] " fmt "\n", __VA_ARGS__); fflush(stderr)
 
 namespace windows_gpu_recovery {
+
+namespace {
+
+bool RenderEventValues(EVT_HANDLE render_context, EVT_HANDLE event,
+                       std::vector<BYTE>* buffer, DWORD* property_count) {
+  DWORD buffer_used = 0;
+  *property_count = 0;
+
+  if (!EvtRender(render_context, event, EvtRenderEventValues, 0, nullptr,
+                 &buffer_used, property_count)) {
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || buffer_used == 0) {
+      return false;
+    }
+  }
+
+  buffer->resize(buffer_used);
+  return EvtRender(render_context, event, EvtRenderEventValues, buffer_used,
+                   buffer->data(), &buffer_used, property_count) != FALSE;
+}
+
+bool VariantEqualsString(const EVT_VARIANT& value, const wchar_t* expected) {
+  return (value.Type & EVT_VARIANT_TYPE_MASK) == EvtVarTypeString &&
+         value.StringVal != nullptr && wcscmp(value.StringVal, expected) == 0;
+}
+
+bool VariantEqualsUInt16(const EVT_VARIANT& value, USHORT expected) {
+  switch (value.Type & EVT_VARIANT_TYPE_MASK) {
+    case EvtVarTypeUInt16:
+      return value.UInt16Val == expected;
+    case EvtVarTypeUInt32:
+      return value.UInt32Val == expected;
+    case EvtVarTypeUInt64:
+      return value.UInt64Val == expected;
+    default:
+      return false;
+  }
+}
+
+bool IsLiveKernelEvent141(EVT_HANDLE system_render_context,
+                          EVT_HANDLE user_render_context, EVT_HANDLE event) {
+  std::vector<BYTE> system_buffer;
+  DWORD system_property_count = 0;
+  if (!RenderEventValues(system_render_context, event, &system_buffer,
+                         &system_property_count) ||
+      system_property_count < 2) {
+    return false;
+  }
+
+  const auto* system_values =
+      reinterpret_cast<const EVT_VARIANT*>(system_buffer.data());
+  if (!VariantEqualsString(system_values[0], L"Windows Error Reporting") ||
+      !VariantEqualsUInt16(system_values[1], 1001)) {
+    return false;
+  }
+
+  std::vector<BYTE> user_buffer;
+  DWORD user_property_count = 0;
+  if (!RenderEventValues(user_render_context, event, &user_buffer,
+                         &user_property_count) ||
+      user_property_count < 6) {
+    return false;
+  }
+
+  // Windows Error Reporting event 1001 stores unnamed insertion values in
+  // this stable order: bucket, type, event name, response, cab ID, P1, ...
+  const auto* user_values =
+      reinterpret_cast<const EVT_VARIANT*>(user_buffer.data());
+  return VariantEqualsString(user_values[2], L"LiveKernelEvent") &&
+         VariantEqualsString(user_values[5], L"141");
+}
+
+}  // namespace
 
 // ---------------------------------------------------------------------------
 // Vectored Exception Handler
@@ -194,10 +267,7 @@ WindowsGpuRecoveryPlugin::~WindowsGpuRecoveryPlugin() {
   if (host_hwnd_) KillTimer(host_hwnd_, kGpuWatchdogTimerId);
   if (proc_delegate_id_ != 0)
     registrar_->UnregisterTopLevelWindowProcDelegate(proc_delegate_id_);
-  if (application_event_log_) {
-    CloseEventLog(application_event_log_);
-    application_event_log_ = nullptr;
-  }
+  CloseEventLogWatch();
 }
 
 std::optional<LRESULT> WindowsGpuRecoveryPlugin::HandleWindowProc(
@@ -239,164 +309,111 @@ bool WindowsGpuRecoveryPlugin::IsDeviceLost() {
 }
 
 bool WindowsGpuRecoveryPlugin::InitializeEventLogWatch() {
-  if (application_event_log_) return true;
+  if (application_event_subscription_) return true;
 
-  application_event_log_ = OpenEventLogW(nullptr, L"Application");
-  if (!application_event_log_) {
-    GPU_LOGF("Could not open Application event log (error %lu)",
+  CloseEventLogWatch();
+
+  LPCWSTR system_paths[] = {
+      L"Event/System/Provider/@Name",
+      L"Event/System/EventID",
+  };
+  EVT_HANDLE system_render_context =
+      EvtCreateRenderContext(2, system_paths, EvtRenderContextValues);
+  EVT_HANDLE user_render_context =
+      EvtCreateRenderContext(0, nullptr, EvtRenderContextUser);
+  if (!system_render_context || !user_render_context) {
+    GPU_LOGF("Could not create Application event render context (error %lu)",
              GetLastError());
+    if (system_render_context) EvtClose(system_render_context);
+    if (user_render_context) EvtClose(user_render_context);
     return false;
   }
 
-  DWORD oldest_record = 0;
-  DWORD record_count = 0;
-  if (!GetOldestEventLogRecord(application_event_log_, &oldest_record) ||
-      !GetNumberOfEventLogRecords(application_event_log_, &record_count)) {
-    GPU_LOGF("Could not initialize event log cursor (error %lu)",
-             GetLastError());
-    CloseEventLog(application_event_log_);
-    application_event_log_ = nullptr;
-    return false;
+  {
+    std::lock_guard<std::mutex> lock(application_event_mutex_);
+    system_render_context_ = system_render_context;
+    user_render_context_ = user_render_context;
+    application_event_closing_ = false;
   }
 
-  next_event_record_ =
-      record_count == 0 ? oldest_record : oldest_record + record_count;
+  EVT_HANDLE subscription = EvtSubscribe(
+      nullptr, nullptr, L"Application", L"*", nullptr, this,
+      ApplicationEventCallback, EvtSubscribeToFutureEvents);
+  if (!subscription) {
+    GPU_LOGF("Could not subscribe to Application event log (error %lu)",
+             GetLastError());
+    CloseEventLogWatch();
+    return false;
+  }
+  application_event_subscription_ = subscription;
+
   GPU_LOG("LiveKernelEvent 141 watcher initialized");
   return true;
 }
 
+void WindowsGpuRecoveryPlugin::CloseEventLogWatch() {
+  EVT_HANDLE subscription = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(application_event_mutex_);
+    application_event_closing_ = true;
+    subscription = application_event_subscription_;
+    application_event_subscription_ = nullptr;
+  }
+
+  if (subscription) EvtClose(subscription);
+
+  {
+    std::lock_guard<std::mutex> lock(application_event_mutex_);
+    if (system_render_context_) {
+      EvtClose(system_render_context_);
+      system_render_context_ = nullptr;
+    }
+    if (user_render_context_) {
+      EvtClose(user_render_context_);
+      user_render_context_ = nullptr;
+    }
+  }
+}
+
+DWORD CALLBACK WindowsGpuRecoveryPlugin::ApplicationEventCallback(
+    EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID context, EVT_HANDLE event) {
+  auto* plugin = static_cast<WindowsGpuRecoveryPlugin*>(context);
+  std::lock_guard<std::mutex> lock(plugin->application_event_mutex_);
+  if (plugin->application_event_closing_) return ERROR_SUCCESS;
+
+  if (action == EvtSubscribeActionError) {
+    plugin->application_event_error_.store(
+        static_cast<DWORD>(reinterpret_cast<ULONG_PTR>(event)));
+    return ERROR_SUCCESS;
+  }
+
+  if (action != EvtSubscribeActionDeliver) return ERROR_SUCCESS;
+
+  if (!plugin->application_event_delivery_confirmed_.exchange(true)) {
+    GPU_LOG("Application event log watcher received new records");
+  }
+
+  if (IsLiveKernelEvent141(plugin->system_render_context_,
+                           plugin->user_render_context_, event)) {
+    plugin->live_kernel_event_detected_.store(true);
+  }
+  return ERROR_SUCCESS;
+}
+
 bool WindowsGpuRecoveryPlugin::IsLiveKernelEvent141Detected() {
-  // If opening the log failed during registration, retry without treating
-  // historical records as new.
-  if (!application_event_log_ && !InitializeEventLogWatch()) return false;
-
-  DWORD oldest_record = 0;
-  DWORD record_count = 0;
-  if (!GetOldestEventLogRecord(application_event_log_, &oldest_record) ||
-      !GetNumberOfEventLogRecords(application_event_log_, &record_count)) {
-    GPU_LOGF("Could not inspect Application event log (error %lu); reopening",
-             GetLastError());
-    CloseEventLog(application_event_log_);
-    application_event_log_ = nullptr;
+  const DWORD error = application_event_error_.exchange(ERROR_SUCCESS);
+  if (error != ERROR_SUCCESS) {
+    GPU_LOGF("Application event subscription failed (error %lu); reopening",
+             error);
+    CloseEventLogWatch();
     InitializeEventLogWatch();
+  }
+
+  if (!application_event_subscription_ && !InitializeEventLogWatch()) {
     return false;
   }
 
-  if (record_count == 0) {
-    next_event_record_ = 0;
-    return false;
-  }
-
-  const DWORD newest_record = oldest_record + record_count - 1;
-
-  // The log was empty when the watcher initialized; its oldest record is new.
-  if (next_event_record_ == 0) next_event_record_ = oldest_record;
-
-  // EVENTLOG_SEEK_READ returns ERROR_INVALID_PARAMETER when asked to seek to
-  // tail+1 on some Windows versions. Avoid the read until that record exists.
-  if (next_event_record_ == newest_record + 1) return false;
-
-  // The log was cleared/replaced or old records were overwritten. Establish a
-  // fresh tail instead of replaying records that predate this watcher state.
-  if (next_event_record_ < oldest_record || next_event_record_ > newest_record) {
-    next_event_record_ = newest_record + 1;
-    return false;
-  }
-
-  std::vector<BYTE> buffer(64 * 1024);
-
-  while (true) {
-    DWORD bytes_read = 0;
-    DWORD minimum_bytes = 0;
-    if (!ReadEventLogW(application_event_log_,
-                       EVENTLOG_SEEK_READ | EVENTLOG_FORWARDS_READ,
-                       next_event_record_, buffer.data(),
-                       static_cast<DWORD>(buffer.size()), &bytes_read,
-                       &minimum_bytes)) {
-      const DWORD error = GetLastError();
-      if (error == ERROR_HANDLE_EOF) return false;
-
-      if (error == ERROR_INSUFFICIENT_BUFFER && minimum_bytes > buffer.size()) {
-        buffer.resize(minimum_bytes);
-        continue;
-      }
-
-      // The log can be cleared or replaced while the app is running. Reopen it
-      // and establish a new tail cursor rather than replaying old reports.
-      GPU_LOGF("Application event log read failed (error %lu); reopening",
-               error);
-      CloseEventLog(application_event_log_);
-      application_event_log_ = nullptr;
-      InitializeEventLogWatch();
-      return false;
-    }
-
-    BYTE* cursor = buffer.data();
-    BYTE* end = cursor + bytes_read;
-    while (cursor + sizeof(EVENTLOGRECORD) <= end) {
-      auto* record = reinterpret_cast<EVENTLOGRECORD*>(cursor);
-      if (record->Length < sizeof(EVENTLOGRECORD) ||
-          cursor + record->Length > end) {
-        GPU_LOG("Ignoring malformed Application event log record");
-        return false;
-      }
-
-      next_event_record_ = record->RecordNumber + 1;
-
-      // Windows Error Reporting event 1001 stores unnamed insertion strings
-      // in this stable order: bucket, type, event name, response, cab ID,
-      // P1, P2, ... . Thus indexes 2 and 5 correspond to EventName and P1.
-      const wchar_t* source_name =
-          reinterpret_cast<const wchar_t*>(cursor + sizeof(EVENTLOGRECORD));
-      const size_t source_capacity =
-          (record->Length - sizeof(EVENTLOGRECORD)) / sizeof(wchar_t);
-      const bool is_wer_event =
-          std::wmemchr(source_name, L'\0', source_capacity) != nullptr &&
-          wcscmp(source_name, L"Windows Error Reporting") == 0;
-
-      if (is_wer_event && (record->EventID & 0xFFFF) == 1001 &&
-          record->NumStrings >= 6 &&
-          record->StringOffset < record->Length) {
-        const BYTE* record_end = cursor + record->Length;
-        const wchar_t* value =
-            reinterpret_cast<const wchar_t*>(cursor + record->StringOffset);
-        const wchar_t* event_name = nullptr;
-        const wchar_t* p1 = nullptr;
-        bool strings_valid = true;
-
-        for (WORD index = 0; index < record->NumStrings; ++index) {
-          const BYTE* value_bytes = reinterpret_cast<const BYTE*>(value);
-          if (value_bytes >= record_end) {
-            strings_valid = false;
-            break;
-          }
-
-          const size_t remaining_wchars =
-              static_cast<size_t>(record_end - value_bytes) / sizeof(wchar_t);
-          size_t length = 0;
-          while (length < remaining_wchars && value[length] != L'\0') {
-            ++length;
-          }
-          if (length == remaining_wchars) {
-            strings_valid = false;
-            break;
-          }
-
-          if (index == 2) event_name = value;
-          if (index == 5) p1 = value;
-          value += length + 1;
-        }
-
-        if (strings_valid && event_name && p1 &&
-            wcscmp(event_name, L"LiveKernelEvent") == 0 &&
-            wcscmp(p1, L"141") == 0) {
-          return true;
-        }
-      }
-
-      cursor += record->Length;
-    }
-  }
+  return live_kernel_event_detected_.exchange(false);
 }
 
 }  // namespace windows_gpu_recovery

@@ -6,9 +6,12 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <winevt.h>
 #include <wrl/client.h>
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 #include "include/windows_gpu_recovery/gpu_recovery_message.h"
@@ -52,9 +55,17 @@ class WindowsGpuRecoveryPlugin : public flutter::Plugin {
   /// Returns true if a new WER LiveKernelEvent with P1=141 was logged.
   bool IsLiveKernelEvent141Detected();
 
-  /// Opens the Application event log and starts its cursor at the current end,
-  /// so reports from before this plugin instance started are ignored.
+  /// Subscribes to future Application event log records, so reports from
+  /// before this plugin instance started are ignored.
   bool InitializeEventLogWatch();
+
+  /// Closes all handles used by the Application event log subscription.
+  void CloseEventLogWatch();
+
+  /// Receives records and subscription errors from the Windows Event Log
+  /// service.
+  static DWORD CALLBACK ApplicationEventCallback(
+      EVT_SUBSCRIBE_NOTIFY_ACTION action, PVOID context, EVT_HANDLE event);
 
   flutter::PluginRegistrarWindows* registrar_;
   flutter::FlutterView* view_;
@@ -67,10 +78,15 @@ class WindowsGpuRecoveryPlugin : public flutter::Plugin {
   /// which would succeed because the adapter recovers in ~100ms.
   Microsoft::WRL::ComPtr<ID3D11Device> sentinel_device_;
 
-  /// Legacy Event Log API handle and next record cursor. Application records
-  /// are readable by normal desktop applications without elevation.
-  HANDLE application_event_log_ = nullptr;
-  DWORD next_event_record_ = 0;
+  /// Push subscription for future records in the Application channel.
+  EVT_HANDLE application_event_subscription_ = nullptr;
+  EVT_HANDLE system_render_context_ = nullptr;
+  EVT_HANDLE user_render_context_ = nullptr;
+  std::mutex application_event_mutex_;
+  bool application_event_closing_ = true;
+  std::atomic_bool application_event_delivery_confirmed_{false};
+  std::atomic_bool live_kernel_event_detected_{false};
+  std::atomic<DWORD> application_event_error_{ERROR_SUCCESS};
 };
 
 }  // namespace windows_gpu_recovery

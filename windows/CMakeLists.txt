@@ -59,6 +59,7 @@ target_link_libraries(${PLUGIN_NAME} PRIVATE flutter flutter_wrapper_plugin)
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   dxgi
   d3d11
+  wevtapi
 )
 
 # List of absolute paths to libraries that should be bundled with the plugin.
