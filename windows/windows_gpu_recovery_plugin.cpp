@@ -270,17 +270,37 @@ bool WindowsGpuRecoveryPlugin::IsLiveKernelEvent141Detected() {
   // historical records as new.
   if (!application_event_log_ && !InitializeEventLogWatch()) return false;
 
-  // An empty log has no valid seek record. Once its first record appears,
-  // begin reading at the then-current oldest record.
-  if (next_event_record_ == 0) {
-    DWORD oldest_record = 0;
-    DWORD record_count = 0;
-    if (!GetOldestEventLogRecord(application_event_log_, &oldest_record) ||
-        !GetNumberOfEventLogRecords(application_event_log_, &record_count) ||
-        record_count == 0) {
-      return false;
-    }
-    next_event_record_ = oldest_record;
+  DWORD oldest_record = 0;
+  DWORD record_count = 0;
+  if (!GetOldestEventLogRecord(application_event_log_, &oldest_record) ||
+      !GetNumberOfEventLogRecords(application_event_log_, &record_count)) {
+    GPU_LOGF("Could not inspect Application event log (error %lu); reopening",
+             GetLastError());
+    CloseEventLog(application_event_log_);
+    application_event_log_ = nullptr;
+    InitializeEventLogWatch();
+    return false;
+  }
+
+  if (record_count == 0) {
+    next_event_record_ = 0;
+    return false;
+  }
+
+  const DWORD newest_record = oldest_record + record_count - 1;
+
+  // The log was empty when the watcher initialized; its oldest record is new.
+  if (next_event_record_ == 0) next_event_record_ = oldest_record;
+
+  // EVENTLOG_SEEK_READ returns ERROR_INVALID_PARAMETER when asked to seek to
+  // tail+1 on some Windows versions. Avoid the read until that record exists.
+  if (next_event_record_ == newest_record + 1) return false;
+
+  // The log was cleared/replaced or old records were overwritten. Establish a
+  // fresh tail instead of replaying records that predate this watcher state.
+  if (next_event_record_ < oldest_record || next_event_record_ > newest_record) {
+    next_event_record_ = newest_record + 1;
+    return false;
   }
 
   std::vector<BYTE> buffer(64 * 1024);
