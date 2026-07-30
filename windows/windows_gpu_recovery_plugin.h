@@ -24,6 +24,8 @@ constexpr UINT kWatchdogIntervalMs = 2000;
 /// Detection: a sentinel D3D11 device is created on the same adapter as
 /// ANGLE at startup. When the GPU resets (sleep, TDR, VM restore), the
 /// sentinel's GetDeviceRemovedReason() returns DEVICE_REMOVED permanently.
+/// The Windows Application event log is also watched for new Windows Error
+/// Reporting LiveKernelEvent records with problem signature P1=141.
 ///
 /// Recovery: a Vectored Exception Handler is installed to catch crashes
 /// during ANGLE cleanup. The plugin posts WM_GPU_RECOVERY to the host
@@ -47,6 +49,13 @@ class WindowsGpuRecoveryPlugin : public flutter::Plugin {
   /// Returns true if the sentinel D3D device reports DEVICE_REMOVED.
   bool IsDeviceLost();
 
+  /// Returns true if a new WER LiveKernelEvent with P1=141 was logged.
+  bool IsLiveKernelEvent141Detected();
+
+  /// Opens the Application event log and starts its cursor at the current end,
+  /// so reports from before this plugin instance started are ignored.
+  bool InitializeEventLogWatch();
+
   flutter::PluginRegistrarWindows* registrar_;
   flutter::FlutterView* view_;
   HWND host_hwnd_ = nullptr;
@@ -57,6 +66,11 @@ class WindowsGpuRecoveryPlugin : public flutter::Plugin {
   /// permanently after any GPU reset — unlike a freshly created test device
   /// which would succeed because the adapter recovers in ~100ms.
   Microsoft::WRL::ComPtr<ID3D11Device> sentinel_device_;
+
+  /// Legacy Event Log API handle and next record cursor. Application records
+  /// are readable by normal desktop applications without elevation.
+  HANDLE application_event_log_ = nullptr;
+  DWORD next_event_record_ = 0;
 };
 
 }  // namespace windows_gpu_recovery

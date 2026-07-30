@@ -21,7 +21,8 @@ https://github.com/user-attachments/assets/b769f469-1701-487c-9459-facba1dde675
 After GPU device loss, a Flutter Windows app freezes forever — rendering stops, the window goes white, Windows marks it "Not Responding". CPU logic (Dart isolate, timers, method channels) continues working, but no frames are drawn.
 
 This plugin:
-1. **Detects** GPU device loss via a persistent sentinel D3D11 device (2-second polling)
+1. **Detects** GPU failure via a persistent sentinel D3D11 device or a new
+   Windows Error Reporting `LiveKernelEvent` with `P1=141` (2-second polling)
 2. **Destroys** the dead Flutter engine with crash protection (Vectored Exception Handler catches ANGLE cleanup crashes)
 3. **Recreates** a fresh `FlutterViewController` with new ANGLE display, new D3D device, new Skia context
 4. **Preserves state** — app saves state to SharedPreferences before recreation, restores on startup
@@ -175,6 +176,14 @@ windows_gpu_recovery/
 A persistent D3D11 device is created on the same DXGI adapter that ANGLE uses (`FlutterDesktopViewGetGraphicsAdapter`). This sentinel device stays alive for the plugin's lifetime. When the GPU resets, `GetDeviceRemovedReason()` on the sentinel returns `DXGI_ERROR_DEVICE_REMOVED` — permanently, even after the adapter recovers (~100ms).
 
 A freshly created test device would succeed (the adapter is back), so polling with temporary devices gives false negatives. The sentinel device shares the fate of ANGLE's internal device — both get the same `DEVICE_REMOVED` status.
+
+## Detection: LiveKernelEvent 141
+
+The plugin also watches new records in the Windows Application event log.
+Windows Error Reporting event ID 1001 records whose event name is
+`LiveKernelEvent` and whose first problem-signature parameter (`P1`) is `141`
+trigger the same recovery path. The event-log cursor starts at the current end
+when the plugin initializes, so historical reports do not cause a recovery.
 
 ## Recovery: VEH-protected engine recreation
 

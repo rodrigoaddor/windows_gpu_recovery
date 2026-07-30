@@ -1,3 +1,8 @@
+## 0.1.1
+
+* Detects Windows Error Reporting `LiveKernelEvent` records with `P1=141` and
+  triggers the existing Flutter engine recovery path.
+
 ## 0.1.0
 
 * Initial release.

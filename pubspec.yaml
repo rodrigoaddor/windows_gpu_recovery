@@ -1,10 +1,10 @@
 name: windows_gpu_recovery
 description: >
   Flutter Windows plugin that recovers from EGL_CONTEXT_LOST / D3D11 device
-  removed (DXGI_ERROR_DEVICE_REMOVED) after system sleep or GPU driver reset.
-  Uses a sentinel D3D11 device for detection and a Vectored Exception Handler
-  to safely destroy the dead engine and create a fresh one.
-version: 0.1.0
+  removed (DXGI_ERROR_DEVICE_REMOVED) and LiveKernelEvent 141 GPU failures.
+  Uses native Windows detection and a Vectored Exception Handler to safely
+  destroy the dead engine and create a fresh one.
+version: 0.1.1
 
 topics:
   - windows
